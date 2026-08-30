@@ -29,6 +29,7 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    suspend_cancellation,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 
@@ -666,8 +667,31 @@ class BatchedEngine(BaseEngine):
                 await self._mllm_scheduler.stop()
 
             if self._engine:
-                await self._engine.stop()
-                self._engine.engine.close()
+                engine = self._engine
+                try:
+                    await engine.stop()
+                except BaseException:
+                    # Preserve cancellation or the primary stop error while
+                    # still releasing registry and cache state on its owner.
+                    with suspend_cancellation():
+                        try:
+                            await self._run_on_generation_worker(engine.engine.close)
+                        except BaseException as cleanup_error:
+                            if isinstance(
+                                cleanup_error, (KeyboardInterrupt, SystemExit)
+                            ):
+                                raise
+                            logger.error(
+                                "BatchedEngine core cleanup failed after stop error",
+                                exc_info=(
+                                    type(cleanup_error),
+                                    cleanup_error,
+                                    cleanup_error.__traceback__,
+                                ),
+                            )
+                    raise
+                else:
+                    await self._run_on_generation_worker(engine.engine.close)
         finally:
             self._mllm_scheduler = None
             self._engine = None
